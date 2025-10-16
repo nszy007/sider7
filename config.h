@@ -63,6 +63,7 @@ public:
     vector<wstring> _module_names;
     bool _close_sider_on_exit;
     bool _start_minimized;
+    bool _disable_ecores;
     bool _free_side_select;
     bool _match_stats_enabled;
     bool _global_block_input;
@@ -412,6 +413,10 @@ public:
 
         _match_stats_enabled = GetPrivateProfileInt(_section_name.c_str(),
             L"match-stats.enabled", _match_stats_enabled,
+            config_ini);
+
+        _disable_ecores = GetPrivateProfileInt(_section_name.c_str(),
+            L"disable.ecores", _disable_ecores,
             config_ini);
 
         _global_block_input = GetPrivateProfileInt(_section_name.c_str(),

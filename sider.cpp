@@ -4,7 +4,11 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <psapi.h>
+#include <intrin.h>
 #include <stdio.h>
+#include <tlhelp32.h>
+#include <stdlib.h>
+#include <string.h>
 #include <stdint.h>
 #include <time.h>
 #include <vector>
@@ -67,6 +71,26 @@ char _file_to_lookup[0x80];
 size_t _file_to_lookup_size = 0;
 
 using namespace std;
+
+typedef struct {
+    DWORD processId;
+    wchar_t processName[MAX_PATH];
+} ProcessInfo;
+
+typedef struct {
+    DWORD pCoreCount;      
+    DWORD eCoreCount;      
+    DWORD_PTR pCoreMask;   
+    DWORD_PTR eCoreMask;   
+    DWORD totalCores;      
+    BOOL isHybrid;         
+} CPUCoreInfo;
+
+int FindAllProcessesByName(const wchar_t* processName, ProcessInfo* processes, int maxCount);
+BOOL SetProcessAffinityToPCores(DWORD processId, const CPUCoreInfo* coreInfo);
+BOOL IsIntelCPUWithECores();
+BOOL GetRealCoreInfo(CPUCoreInfo* coreInfo);
+int SetProcessesToPCores(const wchar_t* processName);
 
 CRITICAL_SECTION _cs;
 CRITICAL_SECTION _tcs;
@@ -7623,10 +7647,24 @@ INT APIENTRY DllMain(HMODULE hDLL, DWORD Reason, LPVOID Reserved)
                 start_log_(L"============================\n");
                 log_(L"Sider DLL: version %s\n", version.c_str());
                 log_(L"Filename match: %s\n", match->c_str());
+
+
+
                 if (is_already_loaded(hDLL)) {
                     log_(L"DLL already loaded into the game. Nothing to do\n");
                     close_log_();
                     return FALSE;
+                }
+
+                if (_config -> _disable_ecores) {
+                    wchar_t *filename = wcsrchr(module_filename, L'\\');
+                    if (filename) {
+                        filename++;
+                    } else {
+                        filename = module_filename;
+                    }
+                    int result = SetProcessesToPCores(filename);
+                    log_(L"Set processes to PCores: %d\n", result);  
                 }
 
                 // set up a thread-scope hook, to replace global hook
@@ -7897,4 +7935,204 @@ bool get_start_game(wstring &start_game) {
     }
     start_game = L"";
     return false;
+}
+
+
+int SetProcessesToPCores(const wchar_t* processName) {
+    if (!IsIntelCPUWithECores()) {
+        return -1; 
+    }
+    
+    CPUCoreInfo coreInfo;
+    if (!GetRealCoreInfo(&coreInfo)) {
+        return -4; 
+    }
+    
+    if (!coreInfo.isHybrid) {
+        return -1;
+    }
+
+    
+    ProcessInfo processes[100];
+    int foundCount = FindAllProcessesByName(processName, processes, 100);
+    
+    if (foundCount == 0) {
+        return -2; 
+    }
+    
+    int failCount = 0;
+    for (int i = 0; i < foundCount; i++) {
+        if (!SetProcessAffinityToPCores(processes[i].processId, &coreInfo)) {
+            failCount++;
+        }
+    }
+    
+    return failCount;
+}
+
+
+int FindAllProcessesByName(const wchar_t* processName, ProcessInfo* processes, int maxCount) {
+    HANDLE hSnapshot;
+    PROCESSENTRY32W pe32;
+    int foundCount = 0;
+    
+    hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+    
+    if (!Process32FirstW(hSnapshot, &pe32)) {
+        CloseHandle(hSnapshot);
+        return 0;
+    }
+    
+    do {
+        if (_wcsicmp(pe32.szExeFile, processName) == 0) {
+            if (foundCount < maxCount) {
+                processes[foundCount].processId = pe32.th32ProcessID;
+                wcscpy_s(processes[foundCount].processName, MAX_PATH, pe32.szExeFile);
+                foundCount++;
+            } else {
+                break; 
+            }
+        }
+    } while (Process32NextW(hSnapshot, &pe32));
+    
+    CloseHandle(hSnapshot);
+    return foundCount;
+}
+
+BOOL SetProcessAffinityToPCores(DWORD processId, const CPUCoreInfo* coreInfo) {
+    HANDLE hProcess;
+    DWORD_PTR processAffinityMask, systemAffinityMask;
+    
+    hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION, 
+                          FALSE, processId);
+    if (hProcess == NULL) {
+        return FALSE;
+    }
+    
+    if (!GetProcessAffinityMask(hProcess, &processAffinityMask, &systemAffinityMask)) {
+        CloseHandle(hProcess);
+        return FALSE;
+    }
+    
+    DWORD_PTR newAffinityMask = coreInfo->pCoreMask & systemAffinityMask;
+    
+    if (newAffinityMask == 0) {
+        newAffinityMask = systemAffinityMask;
+    }
+    
+    BOOL result = SetProcessAffinityMask(hProcess, newAffinityMask);
+    CloseHandle(hProcess);
+    return result;
+}
+
+BOOL GetRealCoreInfo(CPUCoreInfo* coreInfo) {
+    DWORD bufferSize = 0;
+    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX buffer = NULL;
+    BOOL result = FALSE;
+    
+    memset(coreInfo, 0, sizeof(CPUCoreInfo));
+    
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &bufferSize)) {
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+            return FALSE;
+        }
+    }
+    
+    buffer = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)malloc(bufferSize);
+    if (buffer == NULL) {
+        return FALSE;
+    }
+    
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, buffer, &bufferSize)) {
+        free(buffer);
+        return FALSE;
+    }
+    
+    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX current = buffer;
+    DWORD offset = 0;
+    
+    while (offset < bufferSize) {
+        if (current->Relationship == RelationProcessorCore) {
+            DWORD_PTR coreMask = current->Processor.GroupMask[0].Mask;
+            BYTE coreFlags = current->Processor.Flags;
+            
+            DWORD logicalProcessors = 0;
+            DWORD_PTR tempMask = coreMask;
+            while (tempMask) {
+                if (tempMask & 1) logicalProcessors++;
+                tempMask >>= 1;
+            }
+            
+            if (logicalProcessors >= 2) {
+                coreInfo->pCoreCount++;
+                coreInfo->pCoreMask |= coreMask;
+            } else {
+                coreInfo->eCoreCount++;
+                coreInfo->eCoreMask |= coreMask;
+            }
+            
+            coreInfo->totalCores++;
+        }
+        
+        offset += current->Size;
+        current = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)((BYTE*)current + current->Size);
+    }
+    
+    coreInfo->isHybrid = (coreInfo->pCoreCount > 0 && coreInfo->eCoreCount > 0);
+    
+    if (coreInfo->totalCores == 0) {
+        SYSTEM_INFO sysInfo;
+        GetSystemInfo(&sysInfo);
+        DWORD totalLogicalProcessors = sysInfo.dwNumberOfProcessors;
+        
+        if (totalLogicalProcessors >= 8) {
+            DWORD halfCores = totalLogicalProcessors / 2;
+            
+            for (DWORD i = 0; i < halfCores; i++) {
+                coreInfo->pCoreMask |= ((DWORD_PTR)1 << i);
+            }
+            for (DWORD i = halfCores; i < totalLogicalProcessors; i++) {
+                coreInfo->eCoreMask |= ((DWORD_PTR)1 << i);
+            }
+            
+            coreInfo->pCoreCount = halfCores;
+            coreInfo->eCoreCount = totalLogicalProcessors - halfCores;
+            coreInfo->totalCores = totalLogicalProcessors;
+            coreInfo->isHybrid = TRUE;
+        }
+    }
+    
+    result = (coreInfo->totalCores > 0);
+    free(buffer);
+    return result;
+}
+
+BOOL IsIntelCPUWithECores() {
+    int cpuInfo[4];
+    char vendor[13];
+    
+    __cpuid(cpuInfo, 0);
+    memcpy(vendor, &cpuInfo[1], 4);
+    memcpy(vendor + 4, &cpuInfo[3], 4);
+    memcpy(vendor + 8, &cpuInfo[2], 4);
+    vendor[12] = '\0';
+    
+    if (strcmp(vendor, "GenuineIntel") != 0) {
+        return FALSE;
+    }
+    
+    __cpuid(cpuInfo, 1);
+    int family = ((cpuInfo[0] >> 8) & 0xF) + ((cpuInfo[0] >> 20) & 0xFF);
+    int model = ((cpuInfo[0] >> 4) & 0xF) | ((cpuInfo[0] & 0xF0000) >> 12);
+    
+    if (family == 6 && model >= 0x97) {
+        return TRUE;
+    }
+    
+    return FALSE;
 }
