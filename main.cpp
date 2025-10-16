@@ -134,12 +134,17 @@ int APIENTRY WinMain(HINSTANCE hInstance,
     wstring work_dir;
     if (get_start_game(start_game)) {
         applog_(L"start.game: %s\n", start_game.c_str());
-        int pos = start_game.rfind(L"\\");
-        if (pos != string::npos) {
-            work_dir = start_game.substr(0, pos);
-            applog_(L"working directory: %s\n", work_dir.c_str());
+        wchar_t absolute_path[MAX_PATH];
+        if (GetFullPathName(start_game.c_str(), MAX_PATH, absolute_path, NULL)) {
+            wstring abs_game_path = absolute_path;
+            
+            int pos = abs_game_path.rfind(L"\\");
+            if (pos != wstring::npos) {
+                work_dir = abs_game_path.substr(0, pos);
+                applog_(L"working directory: %s\n", work_dir.c_str());
+            }
+            ShellExecute(NULL, L"open", abs_game_path.c_str(), 0, work_dir.c_str(), SW_SHOWNORMAL);
         }
-        ShellExecute(NULL,L"open",start_game.c_str(),0,work_dir.c_str(),SW_SHOWNORMAL);
     }
 
     //SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS);
